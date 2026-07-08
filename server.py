@@ -9,7 +9,7 @@ MODEL = "claude-haiku-4-5-20251001"
 
 PROMPT = """You translate a natural-language command about a 3D physics sandbox into ONE JSON action spec. Output ONLY the JSON object — no prose, no code fences.
 
-Scene: a humanoid mannequin ragdoll (~1.6 m tall) plus movable props, listed here:
+Scene inventory — the current environment, its named targets, and movable props:
 __INVENTORY__
 
 Output schema (omit fields that don't apply):
@@ -17,7 +17,7 @@ Output schema (omit fields that don't apply):
   "action": "throw" | "drop",
   "object": {"id": "<existing prop id>"} OR {"shape": "box" | "sphere", "size": <meters: cube edge or sphere diameter>, "mass": <kg>},
   "count": <objects per run, default 1>,
-  "target": "torso" | "head" | "pelvis",
+  "target": "<one of the target names in the inventory: e.g. head|torso|pelvis in 'ragdoll', or ramp|box in 'ramp'>",
   "speed": <m/s, throw only; convert units (1 mph = 0.447 m/s)>,
   "height": <drop height in meters, drop only, default 3.5>,
   "jitterDeg": <random aim/position spread per run in degrees, default 3>,
@@ -31,6 +31,7 @@ Output schema (omit fields that don't apply):
 
 Rules:
 - SWEEP whenever the command says "sweep", "ramp", "step ... up/down", or gives an incremental RANGE across runs ("from 1 to 100 mph", "1 mph, 2 mph, … 100 mph", "increasing speed"). Emit a "sweep" object: {"param":"speed"|"height"|"count","from":<SI start>,"to":<SI end>,"steps":<run count>}. Do NOT also output top-level "runs" or the swept field. "across/over N runs" → steps=N. Convert from/to to SI. Set jitterDeg=0 and a short duration like 2 so every run is a clean, comparable snapshot. NEVER write the swept field as an array like "speed":[0.45,44.7] — always use the "sweep" object. A plain "50 times at 30 mph" is NOT a sweep — that repeats one identical throw → runs=50. Sweep example: "throw boxes at the head, sweep speed from 1 to 100 mph across 50 runs" -> {"action":"throw","object":{"shape":"box","size":0.3,"mass":5},"target":"head","sweep":{"param":"speed","from":0.45,"to":44.7,"steps":50},"jitterDeg":0,"duration":2,"note":"ramp box speed 1->100 mph at the head across 50 runs"}.
+- TARGET must be one of the target names in the inventory for the current environment. In the "ramp" environment: DROP a ball onto target "ramp" (the concave scoop launches it into the tower); target "box" is the tower to topple. Do not "throw" at the ramp — the scenario is a ball falling onto it.
 - START POSITION is FIXED by default — the object spawns from the same spot every run. Only set "reseed":true (which randomizes the spawn direction per run) when the command explicitly asks for random/varied/different/"from a random direction" starts. Set "origin" only when the command specifies where to throw from ("from behind", "from 5 m away", "from above"). Do NOT randomize the start otherwise.
 - "the box" / "the ball" refers to an existing prop when one plausibly matches; use its id. Otherwise define the object inline with realistic size and mass for what was named (a tire ~ 9 kg 0.65 m, a brick ~ 2.5 kg 0.2 m, etc. — approximate any object with a box or sphere).
 - "100 times" means runs=100 (the whole scenario repeats from the same starting scene). "drop 10 balls" means count=10 within each run.

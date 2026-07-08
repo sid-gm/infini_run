@@ -54,6 +54,24 @@ downstream is deterministic, reproducible code.
   at one setting. Runs are addressed by **index** here (seeds can repeat). The results
   table shows the swept value per row; "Play all" + the `s/run` box replay the ramp.
   Supported params: `speed`, `height`, `count`.
+- **Switchable environments** — the scene is no longer hardcoded. Two ship today, chosen from a
+  two-button switcher in the HUD that tears the scene down and rebuilds:
+  - **Ragdoll** — the original mannequin.
+  - **Ball + Ramp** — a concave **scoop** that catches a dropped ball and launches it sideways
+    into a tall, thin **tower**; the goal/metric is toppling the tower (tilt > 50°). The scoop is
+    a **compound collider** (thin box slabs laid along an arc) because cannon-es can't collide a
+    concave mesh — one convex slab per segment, glued into one static body.
+
+  Each environment is just a set of hooks the shared engine reads — `targetPoint(name)`,
+  `inventory(r3)`, `stepMetrics`/`finishMetrics`, `status`/`down`, `clickables`/`onClick`,
+  `quickAction` — plus its own baseline contact `friction`/`restitution` (the ragdoll is soft and
+  sticky; the ramp uses a smooth, elastic "steel ball" regime so energy survives the scoop).
+  Fixtures (static ramp geometry) are added via `addFixture` and kept out of `dynamic[]`/snapshot;
+  `clearScene` tears everything down on a switch. Sweeps carry over unchanged: a drop-height sweep
+  on the ramp shows a clean topple threshold (stands below ~4.2 m, falls at ~4.7 m+).
+  **Saved tests are per-environment**: each saved batch is tagged with its `env`, and "Load saved
+  tests" / "Clear all" only ever show or clear the active environment's tests (a ragdoll spec can't
+  be replayed against the ramp scene). Untagged tests from before this change count as ragdoll.
 
 Verified end-to-end: "throw the box at the human 100 times at 50 mph" → `{action: throw,
 object: box_1, target: torso, speed: 22.35, runs: 100}` → 100 simulated runs → replay.
@@ -125,7 +143,8 @@ identical object (same dims, same mass) — otherwise you're comparing different
   (trimesh-vs-box doesn't work), so arbitrary meshes need convex hulls — or Rapier.
 - Batch runs are single-threaded on the main thread (fine at current scale).
 - Determinism is same-machine/same-browser, not cross-platform bit-exact.
-- One hardcoded actor (the mannequin); scene starts from one fixed layout.
+- Environments are hand-written builders (two so far); there's no LLM-driven scene construction
+  or stacking yet, and the ramp's topple behaviour is chaotic near the threshold (elastic bounces).
 
 ## Roadmap → "chaotic environments via LLM"
 
@@ -137,7 +156,9 @@ Rough order of attack; each step builds on the previous without rework:
 2. **Scene construction verbs.** `spawn`/`place`/`stack` actions so the LLM can *build*
    the environment ("put a wall of 20 boxes behind him", "scatter 30 balls around") —
    this is the core of user-created chaos. Scene setup commands mutate the live scene;
-   batch commands snapshot it.
+   batch commands snapshot it. _(First step done: the environment layer + a hand-built
+   Ball + Ramp scene exist; next is letting the LLM assemble fixtures/stacks instead of
+   hand-writing each builder.)_
 3. **More object vocabulary.** Cylinders + compound bodies (tire, ladder, table as
    welded primitives), LLM-estimated dimensions. Then an asset cache folder for pretty
    GLB visuals (Poly Pizza retrieval or image→3D generation) mapped onto the same
