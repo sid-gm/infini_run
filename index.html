@@ -29,6 +29,8 @@
   button:disabled { opacity: 0.4; cursor: default; }
   .camrow { display: flex; gap: 6px; }
   .camrow button { flex: 1; width: auto; margin: 6px 0; }
+  #envRow { margin-bottom: 4px; }
+  #envRow button.active { background: #8fd18f; color: #14171c; border-color: transparent; }
   #cmd {
     width: 100%; box-sizing: border-box; margin-top: 10px; padding: 8px;
     font-size: 12px; font-family: inherit; color: #e8e6e1; resize: vertical;
@@ -104,7 +106,12 @@
 <div id="app"></div>
 
 <div id="hud" class="panel">
+  <div class="camrow" id="envRow">
+    <button id="envRagdoll" class="secondary">Ragdoll</button>
+    <button id="envRamp" class="secondary">Ball + Ramp</button>
+  </div>
   <p id="status"></p>
+  <button id="quickAction" class="secondary">Drop a crate</button>
   <button id="reset" class="secondary">Reset scene</button>
   <div class="camrow">
     <button id="camIso" class="secondary">Isometric</button>
@@ -207,6 +214,8 @@ let replayStepsLeft = 0;   // deterministic fixed-step replay countdown
 let playState = null;      // sequential "play all" walker: { idx, frames, restFrames, limitFrames }
 let loopSeconds = 0;       // fixed seconds per run in "play all" (0 = play until motion settles)
 let lastBatch = null;      // { spec, baseSnap, results }
+let env = null;            // active environment (ragdoll | ramp): targets, metrics, inventory, status hooks
+const envFixtures = [];    // static scene geometry (ramp, walls) — in world/scene, NOT snapshotted
 let ragdoll = { parts: [], joints: [] };
 let partByName = {};
 let props = [];
@@ -214,8 +223,9 @@ let propCounter = 0;
 
 const statusEl = document.getElementById('status');
 function updateStatus() {
-  statusEl.textContent = standing ? '● Standing — drop something on it' : '○ Ragdoll — reset to stand it back up';
-  statusEl.classList.toggle('down', !standing);
+  if (!env) return; // no environment built yet (initial module load)
+  statusEl.textContent = env.status();
+  statusEl.classList.toggle('down', env.down());
 }
 
 // Deterministic per-run randomness: same seed → same outcome.
@@ -246,6 +256,45 @@ function unlink(entry) {
   scene.remove(entry.mesh);
   const i = dynamic.indexOf(entry);
   if (i !== -1) dynamic.splice(i, 1);
+}
+
+// Static scene geometry (ramp, walls, platforms). Added like the ground plane — to world +
+// scene but NOT to dynamic[], so it is never synced per-frame, snapshotted, or moved by a
+// restore. Tracked in envFixtures so an environment switch can tear it down.
+function addFixture(body, mesh) {
+  if (mesh) { mesh.castShadow = true; mesh.receiveShadow = true; scene.add(mesh); }
+  world.addBody(body);
+  const f = { body, mesh };
+  envFixtures.push(f);
+  return f;
+}
+
+// Record ball-on-target impacts into the active metrics recorder. Attach to a target body
+// (e.g. the tower); only collisions with props (the thrown/dropped object) count as a hit.
+function attachHitRecorder(body) {
+  body.addEventListener('collide', (e) => {
+    if (!metricsRec || !e.body.isProp) return;
+    const impact = Math.abs(e.contact.getImpactVelocityAlongNormal());
+    if (metricsRec.firstHitT === null) metricsRec.firstHitT = metricsRec.t;
+    if (impact > metricsRec.maxImpact) metricsRec.maxImpact = impact;
+  });
+}
+
+// Tear the whole scene down — actors AND fixtures — so a fresh environment can be built.
+// The shared ground plane lives outside envFixtures/dynamic, so it survives.
+function clearScene() {
+  stopPlayAll();
+  for (const j of ragdoll.joints) world.removeConstraint(j);
+  ragdoll = { parts: [], joints: [] };
+  partByName = {};
+  for (const e of [...dynamic]) unlink(e);
+  for (const f of [...envFixtures]) { world.removeBody(f.body); if (f.mesh) scene.remove(f.mesh); }
+  envFixtures.length = 0;
+  props = [];
+  propCounter = 0;
+  lastBatch = null;
+  replayStepsLeft = 0;
+  document.getElementById('results').hidden = true;
 }
 
 // ---------- mannequin ragdoll ----------
@@ -357,16 +406,39 @@ function buildRagdoll() {
 
   freezeRagdoll();
 }
+// (Teardown is handled generically by clearScene(), which every environment switch calls.)
 
-function destroyRagdoll() {
-  for (const joint of ragdoll.joints) world.removeConstraint(joint);
-  for (const part of [...ragdoll.parts]) unlink(part);
-  ragdoll = { parts: [], joints: [] };
-  partByName = {};
+// ---------- environment 1: the mannequin ----------
+// buildRagdoll() creates the 11 bodies + joints (frozen standing). The env object below is
+// just the hooks the shared engine reads — target resolution, metrics, inventory, status.
+function buildRagdollEnv() {
+  buildRagdoll();
+  return {
+    id: 'ragdoll',
+    friction: 0.4, restitution: 0.05, // soft, sticky bodies
+    quickLabel: 'Drop a crate',
+    cmdHint: 'e.g. throw the box at the human 100 times at 50 mph',
+    quickAction: () => {
+      if (busy || playState) return;
+      applyAction({ action: 'drop', object: { shape: 'box', size: 0.4, mass: 8 }, target: 'torso', height: 3.2, jitterDeg: 6 }, mulberry32(1));
+    },
+    status: () => standing ? '● Standing — drop something on it' : '○ Ragdoll — reset to stand it back up',
+    down: () => !standing,
+    targetPoint: (name) => (partByName[name] || partByName.torso).body.position.clone(),
+    clickables: () => ragdoll.parts,
+    onClick: (part, point, dir) => {
+      releaseRagdoll();
+      part.body.wakeUp();
+      part.body.applyImpulse(new CANNON.Vec3(dir.x * 25, dir.y * 25 + 5, dir.z * 25), new CANNON.Vec3(point.x, point.y, point.z));
+    },
+    inventory: (r3) => ({
+      environment: 'ragdoll',
+      mannequin: { standing, heightMeters: 1.6, position: r3(partByName.pelvis.body.position), targetableParts: ['head', 'torso', 'pelvis'] },
+    }),
+    stepMetrics: (rec) => { if (rec.toppledAt === null && partByName.head.body.position.y < 0.8) rec.toppledAt = rec.t; },
+    finishMetrics: () => ({ finalHeadY: partByName.head.body.position.y }),
+  };
 }
-
-buildRagdoll();
-updateStatus();
 
 // ---------- props ----------
 const woodMaterials = [0xc98a4b, 0xb97a3e, 0xd49a5c].map(
@@ -401,19 +473,130 @@ function spawnProp(def, position, velocity = null, angularVelocity = null) {
   return entry;
 }
 
+// ---------- environment 2: ball + scoop ramp + tall tower ----------
+// The scoop is CONCAVE, so it can't be one convex collider: it's a COMPOUND of thin box slabs
+// laid along an arc (each slab is convex → cannon-es collides them all). A dropped ball rides
+// the concave inside, is scooped around the bottom, and launched sideways into the tower.
+const fixtureMat = new THREE.MeshStandardMaterial({ color: 0x2f6f86, roughness: 0.7, metalness: 0.15 });
+const towerMat = new THREE.MeshStandardMaterial({ color: 0xc98a4b, roughness: 0.85 });
+
+// Static compound arc. Slabs sweep from angle aFrom→aTo (rad) on a circle radius R centred at
+// (cx,cy); each slab's INNER face lies on the arc so the ball rides the concave side. Returns
+// { body, group } — the physics compound + a matching visual group (positioned once; static).
+function buildScoop({ cx, cy, R, halfW, thickness, aFrom, aTo, segs }) {
+  const body = new CANNON.Body({ mass: 0 });
+  const group = new THREE.Group();
+  for (let i = 0; i < segs; i++) {
+    const a0 = aFrom + (aTo - aFrom) * (i / segs);
+    const a1 = aFrom + (aTo - aFrom) * ((i + 1) / segs);
+    const am = (a0 + a1) / 2;
+    const chord = 2 * R * Math.abs(Math.sin((a1 - a0) / 2));
+    const len = chord * 1.3;                       // overlap neighbours so the ball never snags a seam
+    const px = cx + (R + thickness / 2) * Math.cos(am); // push slab just outside the arc so its
+    const py = cy + (R + thickness / 2) * Math.sin(am); // inner face sits exactly on radius R
+    const q = new CANNON.Quaternion().setFromEuler(0, 0, am + Math.PI / 2);
+    body.addShape(new CANNON.Box(new CANNON.Vec3(len / 2, thickness / 2, halfW)), new CANNON.Vec3(px, py, 0), q);
+    const seg = new THREE.Mesh(new THREE.BoxGeometry(len, thickness, halfW * 2), fixtureMat);
+    seg.position.set(px, py, 0);
+    seg.quaternion.set(q.x, q.y, q.z, q.w);
+    group.add(seg);
+  }
+  return { body, group };
+}
+
+function buildRampEnv() {
+  // aFrom 360° (vertical back wall) sweeping to 245° (lip that kicks up-and-left toward the tower).
+  const cfg = { cx: 1.5, cy: 1.2, R: 1.1, halfW: 0.55, thickness: 0.13, aFrom: Math.PI * 2, aTo: Math.PI * 245 / 180, segs: 16 };
+  const scoop = buildScoop(cfg);
+  addFixture(scoop.body, scoop.group);
+
+  // The tall tower to knock over (dynamic). Tall + thin + light → topples when hit hard enough.
+  // Placed close to the scoop's exit so the ball strikes it before rolling friction bleeds speed.
+  const dim = { x: 0.6, y: 2.4, z: 0.6 };
+  const towerBody = new CANNON.Body({
+    mass: 8,
+    shape: new CANNON.Box(new CANNON.Vec3(dim.x / 2, dim.y / 2, dim.z / 2)),
+    position: new CANNON.Vec3(-0.2, dim.y / 2, 0),
+    linearDamping: 0.01, angularDamping: 0.01,
+  });
+  attachHitRecorder(towerBody);
+  const tower = link(towerBody, new THREE.Mesh(new THREE.BoxGeometry(dim.x, dim.y, dim.z), towerMat));
+  tower.id = 'tower'; tower.shape = 'box'; tower.size = dim.y;
+
+  // Where a "drop" lands: straight above the scoop's catch zone.
+  const dropPoint = new CANNON.Vec3(cfg.cx + 0.65 * cfg.R, 3.4, 0);
+  const up = new CANNON.Vec3();
+  const tiltDeg = () => { towerBody.quaternion.vmult(new CANNON.Vec3(0, 1, 0), up); return Math.acos(Math.max(-1, Math.min(1, up.y))) * 180 / Math.PI; };
+
+  return {
+    id: 'ramp',
+    friction: 0.1, restitution: 0.5, // a smooth, elastic steel ball keeps its energy through the scoop
+    quickLabel: 'Drop a ball',
+    cmdHint: 'e.g. drop a ball on the ramp; sweep the drop height from 1 to 6 m over 40 runs',
+    quickAction: () => {
+      if (busy || playState) return;
+      applyAction({ action: 'drop', object: { shape: 'sphere', size: 0.4, mass: 12 }, target: 'ramp', height: 6, jitterDeg: 0 }, mulberry32(1));
+    },
+    status: () => '● Ball + Ramp — drop a ball on the scoop to topple the tower',
+    down: () => false,
+    // "box"/"tower"/"target" → the tower itself; anything else (incl. "ramp") → the drop point.
+    targetPoint: (name) => (name === 'box' || name === 'tower' || name === 'target') ? towerBody.position.clone() : dropPoint.clone(),
+    clickables: () => [tower],
+    inventory: (r3) => ({
+      environment: 'ramp',
+      description: 'A ball dropped onto target "ramp" (a concave scoop) is launched sideways into the tall "box" tower. Goal: topple the tower.',
+      targets: {
+        ramp: { role: 'drop a ball here — the scoop launches it at the tower', position: r3(dropPoint) },
+        box: { role: 'the tower to topple', sizeMeters: dim.y, massKg: towerBody.mass, position: r3(towerBody.position) },
+      },
+    }),
+    stepMetrics: (rec) => { if (rec.toppledAt === null && tiltDeg() > 50) rec.toppledAt = rec.t; },
+    finishMetrics: () => ({ finalTiltDeg: +tiltDeg().toFixed(1) }),
+  };
+}
+
+// ---------- environment registry + switching ----------
+const ENVIRONMENTS = { ragdoll: buildRagdollEnv, ramp: buildRampEnv };
+const ENV_LABELS = { ragdoll: 'Ragdoll', ramp: 'Ball + Ramp' };
+let currentEnvId = 'ragdoll';
+
+function switchEnv(id) {
+  if (!ENVIRONMENTS[id] || busy) return;
+  clearScene();
+  currentEnvId = id;
+  env = ENVIRONMENTS[id]();
+  // Each environment picks its own baseline contact physics; reflect restitution in the slider.
+  world.defaultContactMaterial.friction = env.friction ?? 0.4;
+  world.defaultContactMaterial.restitution = env.restitution ?? 0.05;
+  const bs = document.getElementById('bounce'), bv = document.getElementById('bounceVal');
+  if (bs) { bs.value = env.restitution ?? 0.05; bv.textContent = (env.restitution ?? 0.05).toFixed(2); }
+  syncEnvUI();
+  updateStatus();
+  // If the saved-tests list is open, refresh it so it shows THIS environment's tests only.
+  const savedList = document.getElementById('savedList');
+  if (savedList && !savedList.hidden) renderSavedList();
+}
+
+function syncEnvUI() {
+  for (const [eid, btnId] of [['ragdoll', 'envRagdoll'], ['ramp', 'envRamp']]) {
+    document.getElementById(btnId)?.classList.toggle('active', eid === currentEnvId);
+  }
+  const qa = document.getElementById('quickAction');
+  if (qa) qa.textContent = env?.quickLabel ?? 'Drop a crate';
+  const cmd = document.getElementById('cmd');
+  if (cmd && env?.cmdHint) cmd.placeholder = env.cmdHint;
+}
+
 function resetScene() {
-  stopPlayAll(); // don't let a running sequence advance into a torn-down scene
-  for (const prop of [...props]) unlink(prop);
-  props = [];
-  destroyRagdoll();
-  buildRagdoll();
-  lastBatch = null;
-  document.getElementById('results').hidden = true;
+  switchEnv(currentEnvId); // rebuild the current environment from scratch
 }
 
 document.getElementById('reset').addEventListener('click', () => { if (!busy) resetScene(); });
 document.getElementById('camIso').addEventListener('click', setIsometricView);
 document.getElementById('camFree').addEventListener('click', setFreeView);
+document.getElementById('envRagdoll').addEventListener('click', () => switchEnv('ragdoll'));
+document.getElementById('envRamp').addEventListener('click', () => switchEnv('ramp'));
+document.getElementById('quickAction').addEventListener('click', () => env?.quickAction?.());
 
 const bounceSlider = document.getElementById('bounce');
 const bounceVal = document.getElementById('bounceVal');
@@ -424,17 +607,12 @@ bounceSlider.addEventListener('input', () => {
 });
 
 // ---------- scene inventory (what the LLM "sees") ----------
+// The active environment describes itself (mannequin, or ramp + tower); props are shared.
 function sceneInventory() {
   const r3 = (v) => [+v.x.toFixed(2), +v.y.toFixed(2), +v.z.toFixed(2)];
-  return {
-    mannequin: {
-      standing,
-      heightMeters: 1.6,
-      position: r3(partByName.pelvis.body.position),
-      targetableParts: ['head', 'torso', 'pelvis'],
-    },
-    props: props.map((p) => ({ id: p.id, shape: p.shape, sizeMeters: p.size, massKg: p.body.mass, position: r3(p.body.position) })),
-  };
+  const inv = env.inventory(r3);
+  inv.props = props.map((p) => ({ id: p.id, shape: p.shape, sizeMeters: p.size, massKg: p.body.mass, position: r3(p.body.position) }));
+  return inv;
 }
 
 // ---------- snapshot / restore ----------
@@ -483,8 +661,7 @@ function restore(snap) {
 // ---------- actions ----------
 function getTargetPoint(target) {
   if (Array.isArray(target) && target.length === 3) return new CANNON.Vec3(target[0], target[1], target[2]);
-  const part = partByName[target] || partByName.torso;
-  return part.body.position.clone();
+  return env.targetPoint(target);
 }
 
 function jitterDirection(dir, deg, rng) {
@@ -618,15 +795,13 @@ function fmtSweep(param, v) {
 function runHeadless(spec, seed, baseSnap) {
   restore(baseSnap);
   const rng = mulberry32(seed);
-  metricsRec = { t: 0, firstHitT: null, maxImpact: 0, releasedAt: null };
+  metricsRec = { t: 0, firstHitT: null, maxImpact: 0, releasedAt: null, toppledAt: null };
   applyAction(spec, rng);
   const steps = Math.round((spec.duration ?? 6) * 60);
-  const head = partByName.head.body;
-  let toppledAt = null;
   for (let i = 0; i < steps; i++) {
     world.step(1 / 60);
     metricsRec.t = (i + 1) / 60;
-    if (toppledAt === null && head.position.y < 0.8) toppledAt = metricsRec.t;
+    env.stepMetrics(metricsRec); // environment decides what "toppled" means (head down / tower tipped)
   }
   const m = metricsRec;
   metricsRec = null;
@@ -635,8 +810,8 @@ function runHeadless(spec, seed, baseSnap) {
     hit: m.firstHitT !== null,
     firstHitT: m.firstHitT,
     maxImpact: m.maxImpact,
-    toppledAt,
-    finalHeadY: head.position.y,
+    toppledAt: m.toppledAt,
+    ...env.finishMetrics(),
   };
 }
 
@@ -900,7 +1075,8 @@ function persistSavedTests(list) {
 
 function saveTest(command, spec, results) {
   const list = loadSavedTests();
-  list.push({ id: `${Date.now()}_${Math.floor(Math.random() * 1e6)}`, savedAt: Date.now(), command, spec, results });
+  // Tag each test with the environment it was run in — a test is only replayable in its own env.
+  list.push({ id: `${Date.now()}_${Math.floor(Math.random() * 1e6)}`, savedAt: Date.now(), env: currentEnvId, command, spec, results });
   while (list.length > SAVE_CAP) list.shift();
   persistSavedTests(list);
 }
@@ -914,6 +1090,7 @@ function applySavedTest(id) {
   if (busy) return;
   const test = loadSavedTests().find((t) => t.id === id);
   if (!test) return;
+  if ((test.env ?? 'ragdoll') !== currentEnvId) return; // never replay another env's spec here
   // Rebuild the replay base from whatever is in the scene right now (default scene after a
   // refresh). Stored per-run seeds still reproduce each run against that base.
   lastBatch = { spec: test.spec, baseSnap: snapshot(), results: test.results };
@@ -926,13 +1103,16 @@ function applySavedTest(id) {
 
 function renderSavedList() {
   const el = document.getElementById('savedList');
-  const list = loadSavedTests().slice().reverse(); // newest first
+  const envName = ENV_LABELS[currentEnvId] ?? currentEnvId;
+  // Only this environment's tests: a ragdoll spec can't be replayed against the ramp scene, so
+  // the two environments keep separate, non-mixing lists (older untagged tests count as ragdoll).
+  const list = loadSavedTests().filter((t) => (t.env ?? 'ragdoll') === currentEnvId).reverse(); // newest first
   if (!list.length) {
-    el.innerHTML = '<div class="hint"><span>No saved tests yet — run one first.</span></div>';
+    el.innerHTML = `<div class="hint"><span>No saved ${esc(envName)} tests yet — run one first.</span></div>`;
     return;
   }
   el.innerHTML =
-    '<div class="hint"><span>Saved tests — click to load</span><a data-clear="1">Clear all</a></div>' +
+    `<div class="hint"><span>Saved ${esc(envName)} tests — click to load</span><a data-clear="1">Clear all</a></div>` +
     list.map((t) => {
       const topples = t.results.filter((r) => r.toppledAt !== null).length;
       const label = esc((t.command || t.spec.note || t.spec.action || 'test').slice(0, 42));
@@ -944,7 +1124,8 @@ function renderSavedList() {
       </div>`;
     }).join('');
   el.querySelector('[data-clear]')?.addEventListener('click', () => {
-    persistSavedTests([]);
+    // Clear only THIS environment's tests, leaving the other environment's list intact.
+    persistSavedTests(loadSavedTests().filter((t) => (t.env ?? 'ragdoll') !== currentEnvId));
     renderSavedList();
   });
   for (const row of el.querySelectorAll('.run.saved')) {
@@ -963,25 +1144,29 @@ document.getElementById('loadTests').addEventListener('click', () => {
   if (show) renderSavedList();
 });
 
-// ---------- click to shove the ragdoll ----------
+// ---------- click to shove an actor (environment decides what's clickable) ----------
 const raycaster = new THREE.Raycaster();
 renderer.domElement.addEventListener('pointerdown', (event) => {
-  if (busy) return;
+  if (busy || !env) return;
   raycaster.setFromCamera(
     new THREE.Vector2((event.clientX / innerWidth) * 2 - 1, -(event.clientY / innerHeight) * 2 + 1),
     camera
   );
-  const hits = raycaster.intersectObjects(ragdoll.parts.map((p) => p.mesh));
+  const clickables = env.clickables();
+  const hits = raycaster.intersectObjects(clickables.map((p) => p.mesh));
   if (!hits.length) return;
   const hit = hits[0];
-  const part = ragdoll.parts.find((p) => p.mesh === hit.object);
+  const part = clickables.find((p) => p.mesh === hit.object);
   const dir = raycaster.ray.direction;
-  releaseRagdoll();
-  part.body.wakeUp();
-  part.body.applyImpulse(
-    new CANNON.Vec3(dir.x * 25, dir.y * 25 + 5, dir.z * 25),
-    new CANNON.Vec3(hit.point.x, hit.point.y, hit.point.z)
-  );
+  if (env.onClick) {
+    env.onClick(part, hit.point, dir);
+  } else {
+    part.body.wakeUp();
+    part.body.applyImpulse(
+      new CANNON.Vec3(dir.x * 22, dir.y * 22 + 4, dir.z * 22),
+      new CANNON.Vec3(hit.point.x, hit.point.y, hit.point.z)
+    );
+  }
 });
 
 // ---------- main loop ----------
@@ -1006,6 +1191,7 @@ function animate() {
   controls.update();
   renderer.render(scene, camera);
 }
+switchEnv('ragdoll'); // build the initial environment now that all hooks are defined
 animate();
 
 addEventListener('resize', () => {
